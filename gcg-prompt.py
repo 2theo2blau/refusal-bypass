@@ -4,6 +4,9 @@ import time
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
+import json
+import os
+from datetime import datetime
 
 class GCGSuffixOptimizer:
     def __init__(self,
@@ -51,41 +54,105 @@ class GCGSuffixOptimizer:
         target_len = len(target_tokens)
 
         suffix_indices = torch.arange(prompt_len, prompt_len + self.suffix_len)
-        # target_indices = torch.arange(prompt_len, self.suffix_len, prompt_len + self.suffix_len + target_len)
-        target_start_idx = prompt_len + self.suffix_len
-        target_end_idx = target_start_idx + target_len
-        target_indices = torch.arange(target_start_idx, target_end_idx)
+        # # The old target_indices assumed target followed suffix directly in a longer hypothetical sequence
+        # target_start_idx = prompt_len + self.suffix_len
+        # target_end_idx = target_start_idx + target_len
+        # target_indices = torch.arange(target_start_idx, target_end_idx)
 
         return prompt_tokens.to(self.device), target_tokens.to(self.device), \
-            suffix_indices.to(self.device), target_indices.to(self.device)
+            suffix_indices.to(self.device), target_len # Return target_len instead of target_indices
     
-    def calculate_loss(self, input_ids_batch, target_indices, target_tokens):
-        batch_size = input_ids_batch.shape[0]
+    # Modify calculate_loss to accept the full sequence batch and target length
+    def calculate_loss(self, full_input_ids_batch, target_len, target_tokens):
+        # full_input_ids_batch has shape (batch_size, prompt_len + suffix_len + target_len)
+        batch_size = full_input_ids_batch.shape[0]
+        seq_len = full_input_ids_batch.shape[1] # P + L + T
+        prompt_suffix_len = seq_len - target_len # P + L
 
-        target_indices = target_indices.to(self.device)
-        target_tokens = target_tokens.to(self.device)
+        # Ensure target_tokens is on the correct device and expanded for the batch
+        target_tokens = target_tokens.to(self.device) # Shape (T,)
+        target_tokens_batch = target_tokens.unsqueeze(0).repeat(batch_size, 1) # Shape (B, T)
         
         with torch.no_grad():
-            outputs = self.model(input_ids=input_ids_batch)
-            logits_batch = outputs.logits
+            outputs = self.model(input_ids=full_input_ids_batch)
+            logits_batch = outputs.logits # Shape (B, P + L + T, V)
+            
+            # Get the actual vocabulary size from the logits, not the tokenizer
+            vocab_size = logits_batch.shape[-1]
+            tokenizer_vocab_size = self.tokenizer.vocab_size
+            
+            if vocab_size != tokenizer_vocab_size:
+                print(f"Note: Model's vocabulary size ({vocab_size}) differs from tokenizer's reported size ({tokenizer_vocab_size})")
+            
+            # Safety check for sequence length
+            if logits_batch.shape[1] < prompt_suffix_len:
+                print(f"Warning: Logits sequence length ({logits_batch.shape[1]}) is shorter than expected prompt+suffix length ({prompt_suffix_len})")
+                # Adjust prompt_suffix_len to avoid index errors
+                prompt_suffix_len = logits_batch.shape[1]
+            
+            # Indices for logits that predict the target tokens - ensure we don't go out of bounds
+            start_idx = max(0, prompt_suffix_len - 1)
+            end_idx = min(logits_batch.shape[1] - 1, start_idx + target_len)
+            actual_target_len = end_idx - start_idx
+            
+            if actual_target_len < target_len:
+                print(f"Warning: Could only get {actual_target_len} target positions out of {target_len} expected")
+            
+            target_logit_indices = torch.arange(start_idx, end_idx, device=self.device)
+            
+            # Ensure we're not trying to access indices beyond what's available
+            if target_logit_indices.numel() == 0:
+                print("Error: No valid target logit indices available")
+                # Return a default high loss value to avoid stopping the optimization
+                return torch.ones(batch_size, device=self.device) * 100.0
 
-            target_indices_adjusted = target_indices - 1
-            target_logits = logits_batch[:, target_indices_adjusted, :]
-
-            target_logits_flat = target_logits.view(-1, self.tokenizer.vocab_size)
-            target_tokens_flat = target_tokens.repeat(batch_size)
-            # cross-entropy loss
-            per_token_loss = F.cross_entropy(target_logits_flat, target_tokens_flat, reduction='none')
-            per_token_loss = per_token_loss.view(batch_size, -1)
-            loss_per_batch_item = per_token_loss.mean(dim=1)
+            # Select the relevant logits
+            target_logits = logits_batch[:, target_logit_indices, :]
+            
+            try:
+                # Use actual dimensions for reshaping
+                batch_dim, seq_dim, vocab_dim = target_logits.shape
+                target_logits_flat = target_logits.reshape(batch_dim * seq_dim, vocab_dim)
+                
+                # Adjust target_tokens_batch to match the actual sequence dimension
+                if target_tokens_batch.shape[0] != batch_dim or target_tokens_batch.shape[1] != seq_dim:
+                    # Trim or pad target_tokens_batch to match seq_dim
+                    if target_tokens_batch.shape[1] > seq_dim:
+                        target_tokens_batch = target_tokens_batch[:batch_dim, :seq_dim]
+                    elif target_tokens_batch.shape[1] < seq_dim:
+                        padding = torch.zeros(batch_dim, seq_dim - target_tokens_batch.shape[1], 
+                                              device=self.device, dtype=torch.long)
+                        target_tokens_batch = torch.cat([target_tokens_batch, padding], dim=1)
+                
+                target_tokens_flat = target_tokens_batch.reshape(-1)
+                
+                # cross-entropy loss - ensure tokens are within the vocabulary range
+                target_tokens_flat = torch.clamp(target_tokens_flat, 0, vocab_dim - 1)
+                per_token_loss = F.cross_entropy(target_logits_flat, target_tokens_flat, reduction='none')
+                
+                # Reshape per_token_loss back to batch dimensions
+                per_token_loss = per_token_loss.view(batch_dim, seq_dim)
+                
+                # Calculate mean loss per batch item
+                loss_per_batch_item = per_token_loss.mean(dim=1)
+                
+            except Exception as e:
+                print(f"Error during reshape/loss calculation: {e}")
+                print(f"Target logits shape: {target_logits.shape}, Model vocab size: {vocab_size}")
+                print(f"Target tokens batch shape: {target_tokens_batch.shape}")
+                print(f"Target tokens min: {target_tokens.min().item()}, max: {target_tokens.max().item()}")
+                
+                # Return a default loss to avoid stopping optimization
+                return torch.ones(batch_size, device=self.device) * 100.0
             
             # cleanup
-            del full_input_ids, outputs, logits, target_logits
+            del outputs, logits_batch, target_logits, target_logits_flat, target_tokens_flat
+            del per_token_loss, target_tokens_batch
             torch.cuda.empty_cache()
 
             return loss_per_batch_item
         
-    def calculate_gradient_and_candidates(self, input_ids, suffix_indices, target_indices, target_tokens):
+    def calculate_gradient_and_candidates(self, input_ids, suffix_indices, target_tokens):
         # Create input embeddings with requires_grad=True from the start
         input_len = len(input_ids)
         target_len = len(target_tokens)
@@ -140,8 +207,27 @@ class GCGSuffixOptimizer:
     def optimize_suffix(self, prompt_str):
         print("Starting GCG suffix optimization...")
         start_time = time.time()
+        
+        # Create a timestamped filename for this optimization run
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        model_name_short = self.model.config._name_or_path.split('/')[-1] if hasattr(self.model, 'config') else "model"
+        json_filename = f"gcg_optimization_{model_name_short}_{timestamp}.json"
+        
+        # Initialize the JSON data structure
+        optimization_data = {
+            "model": self.model.config._name_or_path if hasattr(self.model, 'config') else "unknown",
+            "prompt": prompt_str,
+            "target_prefix": self.target_prefix,
+            "suffix_len": self.suffix_len,
+            "batch_size": self.batch_size,
+            "top_k": self.top_k,
+            "num_steps": self.num_steps,
+            "start_time": timestamp,
+            "suffixes": []
+        }
 
-        prompt_tokens, target_tokens, suffix_indices, target_indices = self.tokenize_and_prepare(prompt_str)
+        # Get target_len instead of target_indices
+        prompt_tokens, target_tokens, suffix_indices, target_len = self.tokenize_and_prepare(prompt_str)
         prompt_len = len(prompt_tokens)
 
         current_suffix_tokens = torch.randint(0, self.tokenizer.vocab_size, (self.suffix_len,), device=self.device)
@@ -158,47 +244,12 @@ class GCGSuffixOptimizer:
 
             # candidate generation
             try:
-                top_k_candidates_per_pos = self.calculate_gradient_and_candidates(current_input_ids, suffix_indices, target_indices, target_tokens)
+                # Pass only necessary arguments: input_ids (P+L), suffix_indices, target_tokens
+                top_k_candidates_per_pos = self.calculate_gradient_and_candidates(current_input_ids, suffix_indices, target_tokens)
             except Exception as e:
                 print(f"Error calculating gradient at step {step + 1}: {e}")
                 print("Skipping gradient calculation for this step")
                 continue
-
-            # # batch evaluation
-            # candidate_losses = []
-            # candidate_info = []
-
-            # positions_to_try = random.choices(range(self.suffix_len), k=self.batch_size)
-            # replacement_tokens = []
-            # for pos_idx in positions_to_try:
-            #     candidate_token_idx = random.choice(range(self.top_k))
-            #     replacement_tokens.append(top_k_candidates_per_pos[pos_idx, candidate_token_idx].item())
-            
-            # temp_suffix_tokens_batch = current_suffix_tokens.unsqueeze(0).repeat(self.batch_size, 1)
-
-            # row_indices = torch.arange(self.batch_size)
-            # col_indices = torch.tensor(positions_to_try)
-            # temp_suffix_tokens_batch[row_indices, col_indices] = torch.tensor(replacement_tokens, device=self.device)
-
-            # batch_input_ids = torch.cat([
-            #     prompt_tokens.unsqueeze(0).repeat(self.batch_size, 1),
-            #     temp_suffix_tokens_batch
-            # ], dim=1)
-
-            # current_batch_losses = []
-            # for i in range(self.batch_size):
-            #     loss = self.calculate_loss(batch_input_ids[i], target_indices, target_tokens)
-            #     current_batch_losses.append(loss)
-
-            #     candidate_info.append({
-            #         'pos': positions_to_try[i],
-            #         'token_id': replacement_tokens[i],
-            #         'loss': loss
-            #     })
-
-            # if not candidate_info:
-            #     print(f"No candidates saved at step {step + 1}.")
-            #     continue
 
             positions_to_try = random.choices(range(self.suffix_len), k=self.batch_size)
             replacement_tokens = []
@@ -223,12 +274,20 @@ class GCGSuffixOptimizer:
 
             temp_suffix_tokens_batch.scatter_(1, col_indices.unsqueeze(1), replacement_tokens_tensor.unsqueeze(1))
             
-            batch_input_ids = torch.cat([
-                prompt_tokens.unsqueeze(0).repeat(self.batch_size, 1),
-                temp_suffix_tokens_batch
-            ], dim=1)
+            # Create the full input batch including target tokens
+            prompt_batch = prompt_tokens.unsqueeze(0).repeat(self.batch_size, 1) # Shape (B, P)
+            target_batch = target_tokens.unsqueeze(0).repeat(self.batch_size, 1) # Shape (B, T)
+            
+            # Concatenate: Prompt + Suffix Candidates + Target
+            full_batch_input_ids = torch.cat([
+                prompt_batch,             # (B, P)
+                temp_suffix_tokens_batch, # (B, L)
+                target_batch              # (B, T)
+            ], dim=1) # Shape (B, P+L+T)
 
-            batch_losses = self.calculate_loss(batch_input_ids, target_indices, target_tokens)
+
+            # Pass the full batch, target_len, and original target_tokens to calculate_loss
+            batch_losses = self.calculate_loss(full_batch_input_ids, target_len, target_tokens)
 
             if batch_losses.numel() == 0:
                 print(f"Warning: No valid losses calculated for batch. Skipping this step.")
@@ -243,27 +302,76 @@ class GCGSuffixOptimizer:
             current_suffix_tokens = current_suffix_tokens.clone()
             current_suffix_tokens[best_pos] = best_token_id
 
+            # Calculate step time
+            step_time = time.time() - step_start_time
+            
             # Track best suffix found so far
             if min_batch_loss < best_loss:
                 best_loss = min_batch_loss
                 best_suffix_tokens = current_suffix_tokens.clone()
+                suffix_str = self.tokenizer.decode(best_suffix_tokens)
                 print(f"Step {step + 1}/{self.num_steps} | New Best Loss: {best_loss:.4f} **")
+                
+                # Add to JSON data every time we find a new best suffix
+                optimization_data["suffixes"].append({
+                    "step": step + 1,
+                    "loss": best_loss,
+                    "suffix": suffix_str,
+                    "type": "best",
+                    "time": time.time() - start_time
+                })
+                
+                # Write the updated data to the JSON file
+                with open(json_filename, 'w') as f:
+                    json.dump(optimization_data, f, indent=2)
             else:
                 print(f"Step {step + 1}/{self.num_steps} | Current Loss: {min_batch_loss:.4f} (Best: {best_loss:.4f})", end='\r')
 
-            step_time = time.time() - step_start_time
-
+            # Every 20 steps, log the current suffix
             if (step + 1) % 20 == 0:
-                print(f"\nSuffix @ step {step + 1}: {self.tokenizer.decode(best_suffix_tokens)}")
+                suffix_str = self.tokenizer.decode(best_suffix_tokens)
+                print(f"\nSuffix @ step {step + 1}: {suffix_str}")
+                
+                # Add to JSON data at the periodic checkpoints
+                optimization_data["suffixes"].append({
+                    "step": step + 1,
+                    "loss": best_loss,
+                    "suffix": suffix_str,
+                    "type": "periodic",
+                    "time": time.time() - start_time
+                })
+                
+                # Write the updated data to the JSON file
+                with open(json_filename, 'w') as f:
+                    json.dump(optimization_data, f, indent=2)
 
+        # End of optimization
         total_time = time.time() - start_time
         print(f"\nOptimization complete! Total time: {total_time:.2f}s")
-        print(f"Final suffix: {self.tokenizer.decode(best_suffix_tokens)}")
+        
+        # Get the final suffix
+        final_suffix = self.tokenizer.decode(best_suffix_tokens, skip_special_tokens=True)
+        print(f"Final suffix: {final_suffix}")
         print(f"Final loss: {best_loss:.4f}")
+        
+        # Add final entry to JSON data
+        optimization_data["suffixes"].append({
+            "step": self.num_steps,
+            "loss": best_loss,
+            "suffix": final_suffix,
+            "type": "final",
+            "time": total_time
+        })
+        optimization_data["total_time"] = total_time
+        optimization_data["final_loss"] = best_loss
+        
+        # Write the final data to the JSON file
+        with open(json_filename, 'w') as f:
+            json.dump(optimization_data, f, indent=2)
+            
+        print(f"Optimization data saved to {json_filename}")
 
-        optimized_suffix = self.tokenizer.decode(best_suffix_tokens, skip_special_tokens=True)
-
-        return optimized_suffix
+        return final_suffix
     
 
     def generate_with_suffix(self, prompt_str, suffix_str, max_new_tokens=100):
